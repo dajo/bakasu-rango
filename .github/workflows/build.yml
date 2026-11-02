@@ -1,0 +1,249 @@
+name: Build BakaSU GKI (Pixel 10 Pro Fold, android15-6.6.127)
+
+# Reproduces the local ~/gki build:
+#   - kernel source pinned to GKI build 16252310 (common @ 91d825611104)
+#   - only clang-r510928 is fetched (avoids the 502 on the huge clang repo)
+#   - BakaSU at the requested version code / commit, CONFIG_KSU=y
+#   - Wi-Fi/BT fix: CONFIG_MODULE_SIG_PROTECT off + protected exports removed
+#   - outputs: Image, AnyKernel3 zip, and new-boot.img if stock/boot.img is in the repo
+
+on:
+  workflow_dispatch:
+    inputs:
+      bakasu:
+        description: "BakaSU version code (e.g. 35257), commit hash, or 'latest'"
+        required: true
+        default: latest
+
+permissions:
+  contents: read
+
+env:
+  GKI_BUILD_ID: "16252310"
+  COMMON_COMMIT: "91d825611104"
+  CLANG_PROJECT: platform/prebuilts/clang/host/linux-x86
+  CLANG_VERSION: r510928
+  BAKASU_REPO: https://github.com/Baka-SU/BakaSU.git
+  AK3_REPO: https://github.com/WildKernels/AnyKernel3.git
+  AK3_BRANCH: gki-2.0
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v4
+
+      - name: Free disk space and add swap
+        run: |
+          set -euxo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go /opt/hostedtoolcache/PyPy \
+            /usr/local/share/powershell /usr/local/share/chromium /usr/local/lib/node_modules \
+            /opt/az /usr/share/swift /usr/local/julia* || true
+          sudo docker image prune -af || true
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile /swapfile
+          sudo fallocate -l 16G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          df -h /
+          free -h
+
+      - name: Install repo and tools
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq git curl python3 zip unzip
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o "$HOME/bin/repo" https://storage.googleapis.com/git-repo-downloads/repo
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          git config --global user.name "ci"
+          git config --global user.email "ci@localhost"
+          git config --global advice.detachedHead false
+          git config --global init.defaultBranch main
+
+      - name: Resolve BakaSU commit
+        id: baka
+        env:
+          IN: ${{ inputs.bakasu }}
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout "$BAKASU_REPO" "$HOME/bakasu-meta"
+          cd "$HOME/bakasu-meta"
+          TOTAL=$(git rev-list --count origin/main)
+          if [ "$IN" = "latest" ]; then
+            SHA=$(git rev-parse origin/main)
+          elif [[ "$IN" =~ ^[0-9]{5}$ ]]; then
+            N=$((IN - 30700))
+            if [ "$N" -lt 1 ] || [ "$N" -gt "$TOTAL" ]; then
+              echo "::error::Version code $IN not on main (latest is $((30700 + TOTAL)))"
+              exit 1
+            fi
+            SHA=$(git rev-list --reverse origin/main | sed -n "${N}p")
+          elif [[ "$IN" =~ ^[0-9a-f]{7,40}$ ]]; then
+            SHA=$(git rev-parse --verify "${IN}^{commit}")
+          else
+            echo "::error::Input must be a 5-digit version code, a commit hash, or 'latest'"
+            exit 1
+          fi
+          CODE=$((30700 + $(git rev-list --count "$SHA")))
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "BakaSU: $(git log -1 --format='%h %s' "$SHA")  -> version code $CODE"
+
+      - name: Sync kernel source (pinned manifest, clang handled separately)
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/gki" && cd "$HOME/gki"
+          MANIFEST="manifest_${GKI_BUILD_ID}.xml"
+          # Drop the giant clang project; it is fetched sparsely in the next step.
+          grep -v "name=\"${CLANG_PROJECT}\"" "$GITHUB_WORKSPACE/$MANIFEST" > "/tmp/$MANIFEST"
+          repo init -u https://android.googlesource.com/kernel/manifest --depth=1
+          cp "/tmp/$MANIFEST" .repo/manifests/
+          repo init -m "$MANIFEST" --depth=1
+          for i in 1 2 3; do
+            repo sync -c --no-tags -j8 --fail-fast && break
+            echo "repo sync failed (attempt $i), retrying"; sleep 30
+          done
+          test "$(git -C common rev-parse --short=12 HEAD)" = "$COMMON_COMMIT"
+
+      - name: Restore cached clang
+        id: clang-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/gki/prebuilts/clang/host/linux-x86
+          key: clang-${{ env.CLANG_VERSION }}-62dc563017359bca29c4a08f5f27d8ecae763462
+
+      - name: Fetch clang (only the version this kernel uses)
+        if: steps.clang-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          REV=$(grep "name=\"${CLANG_PROJECT}\"" "$GITHUB_WORKSPACE/manifest_${GKI_BUILD_ID}.xml" \
+                | grep -o 'revision="[0-9a-f]*"' | cut -d'"' -f2)
+          grep -q "CLANG_VERSION=${CLANG_VERSION}" "$HOME/gki/common/build.config.constants"
+          D="$HOME/gki/prebuilts/clang/host/linux-x86"
+          mkdir -p "$D" && cd "$D"
+          git init -q
+          git remote add aosp "https://android.googlesource.com/${CLANG_PROJECT}"
+          for i in 1 2 3 4 5; do
+            git fetch --depth=1 --filter=blob:none aosp "$REV" && break
+            echo "clang fetch failed (attempt $i), retrying"; sleep 60
+          done
+          git sparse-checkout set "clang-${CLANG_VERSION}" kleaf
+          for i in 1 2 3 4 5; do
+            timeout 2400 git checkout FETCH_HEAD && break
+            echo "clang checkout failed (attempt $i), retrying"; sleep 60
+          done
+          rm -rf .git   # keep only the files; smaller cache, nothing for repo to manage
+          "clang-${CLANG_VERSION}/bin/clang" --version
+          ls kleaf
+
+      - name: Check clang and manifest revision
+        run: |
+          set -euxo pipefail
+          REV=$(grep "name=\"${CLANG_PROJECT}\"" "$GITHUB_WORKSPACE/manifest_${GKI_BUILD_ID}.xml" \
+                | grep -o 'revision="[0-9a-f]*"' | cut -d'"' -f2)
+          test "$REV" = "62dc563017359bca29c4a08f5f27d8ecae763462" || { echo "::error::Manifest clang revision changed ($REV); update the cache key"; exit 1; }
+          "$HOME/gki/prebuilts/clang/host/linux-x86/clang-${CLANG_VERSION}/bin/clang" --version
+
+      - name: Add BakaSU
+        run: |
+          set -euxo pipefail
+          cd "$HOME/gki"
+          # Full history is required: the version code is computed from the commit count.
+          git clone "$BAKASU_REPO" KernelSU
+          git -C KernelSU checkout --detach "${{ steps.baka.outputs.sha }}"
+          ln -s ../../KernelSU/kernel common/drivers/kernelsu
+          grep -q 'obj-$(CONFIG_KSU) += kernelsu/' common/drivers/Makefile ||
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> common/drivers/Makefile
+          grep -q 'source "drivers/kernelsu/Kconfig"' common/drivers/Kconfig ||
+            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' common/drivers/Kconfig
+
+      - name: Apply config and Wi-Fi/BT fixes
+        run: |
+          set -euxo pipefail
+          cd "$HOME/gki"
+          DEF=common/arch/arm64/configs/gki_defconfig
+          grep -q '^CONFIG_KSU=' "$DEF" || echo 'CONFIG_KSU=y' >> "$DEF"
+          sed -i 's/^CONFIG_MODULE_SIG_PROTECT=y/# CONFIG_MODULE_SIG_PROTECT is not set/' "$DEF"
+          rm -f common/android/abi_gki_protected_exports_*
+          sed -i 's/check_defconfig//' common/build.config.gki
+          sed -i "/stable_scmversion_cmd/s/-maybe-dirty//g" build/kernel/kleaf/impl/stamp.bzl
+          sed -i 's/-dirty//' common/scripts/setlocalversion
+          grep -n 'CONFIG_KSU=\|MODULE_SIG_PROTECT' "$DEF"
+          git -C common add -A
+          git -C common commit -qm "BakaSU + Wi-Fi/BT module fix"
+
+      - name: Build kernel
+        run: |
+          set -euo pipefail
+          cd "$HOME/gki"
+          tools/bazel build --config=fast --lto=thin \
+            //common:kernel_aarch64/Image 2>&1 | tee build.log
+
+      - name: Verify build
+        id: verify
+        run: |
+          set -euo pipefail
+          cd "$HOME/gki"
+          IMG=bazel-bin/common/kernel_aarch64/Image
+          CODE=$(grep -oP 'BakaSU version code: \K[0-9]+' build.log | tail -1)
+          NAME=$(grep -oP 'BakaSU version name: \K\S+' build.log | tail -1)
+          echo "Built $NAME ($CODE)"
+          test "$CODE" = "${{ steps.baka.outputs.code }}"
+          CFG=$(common/scripts/extract-ikconfig "$IMG")
+          echo "$CFG" | grep -qx 'CONFIG_KSU=y'
+          echo "$CFG" | grep -qx '# CONFIG_MODULE_SIG_PROTECT is not set'
+          echo "$CFG" | grep -qx '# CONFIG_MODULE_SIG_FORCE is not set'
+          strings "$IMG" | grep -m1 'Linux version 6.6.127-android15-8'
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Package outputs
+        run: |
+          set -euxo pipefail
+          CODE="${{ steps.verify.outputs.code }}"
+          OUT="$GITHUB_WORKSPACE/out" && mkdir -p "$OUT"
+          IMG="$HOME/gki/bazel-bin/common/kernel_aarch64/Image"
+          cp "$IMG" "$OUT/Image"
+
+          git clone -q --depth=1 -b "$AK3_BRANCH" "$AK3_REPO" "$HOME/AnyKernel3"
+          cp "$IMG" "$HOME/AnyKernel3/Image"
+          (cd "$HOME/AnyKernel3" && zip -qr9 "$OUT/BakaSU-${CODE}-AK3.zip" . -x '.git/*' '.github/*' 'README.md')
+
+          if [ -f "$GITHUB_WORKSPACE/stock/boot.img" ]; then
+            URL=$(curl -fsSL https://api.github.com/repos/topjohnwu/Magisk/releases/latest \
+                  | grep -o 'https://[^"]*Magisk-v[^"]*\.apk' | head -1)
+            mkdir -p "$HOME/repack" && cd "$HOME/repack"
+            curl -fsSL -o magisk.zip "$URL"
+            unzip -j -o -q magisk.zip lib/x86_64/libmagiskboot.so
+            mv libmagiskboot.so magiskboot && chmod +x magiskboot
+            cp "$GITHUB_WORKSPACE/stock/boot.img" .
+            ./magiskboot unpack boot.img
+            cp "$IMG" kernel
+            ./magiskboot repack boot.img
+            cp new-boot.img "$OUT/new-boot-${CODE}.img"
+          else
+            echo "No stock/boot.img in repo: skipping new-boot.img (repack locally instead)"
+          fi
+          ls -la "$OUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BakaSU-${{ steps.verify.outputs.code }}-6.6.127
+          path: out/
+          if-no-files-found: error
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ~/gki/build.log
+          if-no-files-found: ignore
